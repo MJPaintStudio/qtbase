@@ -380,6 +380,8 @@ void QWindowsPointerHandler::handleEnterLeave(QWindow *window,
 
             qCDebug(lcQpaEvents) << "Leaving window " << m_windowUnderPointer;
             QWindowSystemInterface::handleLeaveEvent(m_windowUnderPointer);
+            if (m_currentPenWindow == m_windowUnderPointer)
+                m_currentPenWindow = nullptr;
 
             if (hasCapture && currentWindowUnderPointer != window) {
                 // Clear tracking if capturing and current window is not the capturing window
@@ -665,41 +667,50 @@ bool QWindowsPointerHandler::translatePenEvent(QWindow *window, HWND hwnd, QtWin
     switch (msg.message) {
     case WM_POINTERENTER: {
         QWindowSystemInterface::handleTabletEnterLeaveProximityEvent(window, msg.time, device.data(), true);
-        m_windowUnderPointer = window;
-        // The local coordinates may fall outside the window.
-        // Wait until the next update to send the enter event.
+        // The local coordinates may fall outside the window, so wait until the next update
+        // to send the enter event. Do not claim m_windowUnderPointer here: it is shared with
+        // the mouse handling and must only reflect a window we have actually entered.
         m_needsEnterOnPointerUpdate = true;
         break;
     }
     case WM_POINTERLEAVE:
-        if (m_windowUnderPointer && m_windowUnderPointer == m_currentWindow) {
-            QWindowSystemInterface::handleLeaveEvent(m_windowUnderPointer);
-            m_windowUnderPointer = nullptr;
-            m_currentWindow = nullptr;
+        // WM_POINTERLEAVE is the "pen event" we are interested in. It does not depend on
+        // subscription via "trackMouseEvent" like WM_MOUSELEAVE
+        if (m_currentPenWindow == window) {
+            QWindowSystemInterface::handleLeaveEvent(window);
+            m_currentPenWindow = nullptr;
+            if (m_windowUnderPointer == window)
+                m_windowUnderPointer = nullptr;
         }
         QWindowSystemInterface::handleTabletEnterLeaveProximityEvent(window, msg.time, device.data(), false);
         break;
     case WM_POINTERDOWN:
     case WM_POINTERUP:
     case WM_POINTERUPDATE: {
+        // Deliver the pending enter before resolving the target, so that the fallback below
+        // sees the window the pen is over.
+        if (m_needsEnterOnPointerUpdate) {
+            m_needsEnterOnPointerUpdate = false;
+            if (window != m_currentPenWindow) {
+                // Windows may deliver WM_POINTERENTER for the new window before
+                // WM_POINTERLEAVE for the previous one; pair the leave ourselves.
+                if (m_currentPenWindow)
+                    QWindowSystemInterface::handleLeaveEvent(m_currentPenWindow);
+
+                QWindowSystemInterface::handleEnterEvent(window, localPos, globalPos);
+                m_currentPenWindow = window;
+                m_windowUnderPointer = window;
+                if (QWindowsWindow *platformWindow = QWindowsWindow::windowsWindowOf(window))
+                    platformWindow->applyCursor();
+            }
+        }
+
         QWindow *target = QGuiApplicationPrivate::tabletDevicePoint(uniqueId).target; // Pass to window that grabbed it.
         if (!target && m_windowUnderPointer)
             target = m_windowUnderPointer;
         if (!target)
             target = window;
 
-        if (m_needsEnterOnPointerUpdate) {
-            m_needsEnterOnPointerUpdate = false;
-            if (window != m_currentWindow) {
-                // make sure we subscribe to leave events for this window
-                trackLeave(hwnd);
-
-                QWindowSystemInterface::handleEnterEvent(window, localPos, globalPos);
-                m_currentWindow = window;
-                if (QWindowsWindow *wumPlatformWindow = QWindowsWindow::windowsWindowOf(target))
-                    wumPlatformWindow->applyCursor();
-            }
-        }
         const auto *keyMapper = QWindowsContext::instance()->keyMapper();
         const Qt::KeyboardModifiers keyModifiers = keyMapper->queryKeyboardModifiers();
 
@@ -812,6 +823,32 @@ bool QWindowsPointerHandler::translateMouseEvent(QWindow *window,
     Qt::MouseEventSource source = Qt::MouseEventNotSynthesized;
     const QPointingDevice *device = primaryMouse();
 
+    const MouseEvent mouseEvent = eventFromMsg(msg);
+    const bool mousePress = mouseEvent.type == QEvent::MouseButtonPress
+        || mouseEvent.type == QEvent::NonClientAreaMouseButtonPress;
+    const auto suppressPenMouseEvent = [&] {
+        m_penMouseFilter.recordSuppressedButton(mouseEvent.button, mousePress);
+        return false;
+    };
+#if QT_CONFIG(tabletevent)
+    const bool mouseMove = mouseEvent.type == QEvent::MouseMove
+        || mouseEvent.type == QEvent::NonClientAreaMouseMove;
+    if (mouseEvent.button != Qt::NoButton || mouseMove) {
+        if (auto *tablet = QWindowsContext::instance()->tabletSupport()) {
+            INPUT_MESSAGE_SOURCE inputSource{};
+            const bool injected = GetCurrentInputMessageSource(&inputSource)
+                && inputSource.deviceType == IMDT_MOUSE && inputSource.originId == IMO_INJECTED;
+            const bool pressed = mouseEvent.type == QEvent::MouseButtonPress
+                || mouseEvent.type == QEvent::NonClientAreaMouseButtonPress;
+            if ((mouseMove && tablet->mouseFilter().suppressMouseMove(injected))
+                || tablet->mouseFilter().suppressMouseEvent(msg.time, globalPos, mouseEvent.button,
+                                                        pressed, injected, GetTickCount64())) {
+                return suppressPenMouseEvent();
+            }
+        }
+    }
+#endif
+
     // Following the logic of the old mouse handler, only events synthesized
     // for touch screen are marked as such. On some systems, using the bit 7 of
     // the extra msg info for checking if synthesized for touch does not work,
@@ -828,19 +865,39 @@ bool QWindowsPointerHandler::translateMouseEvent(QWindow *window,
         case QT_PT_PEN:
 #if QT_CONFIG(tabletevent)
             qCDebug(lcQpaTablet) << "ignoring synth-mouse event for tablet event from" << device;
-            return false;
+            return suppressPenMouseEvent();
+#endif
+            break;
+        default:
+#if QT_CONFIG(tabletevent)
+            // WinTab events bypass translatePointerEvent(), so m_pointerType does not
+            // identify the legacy mouse messages synthesized for them.
+            if (const auto *tabletSupport = QWindowsContext::instance()->tabletSupport();
+                tabletSupport && tabletSupport->isTabletInProximity()) {
+                qCDebug(lcQpaTablet) << "ignoring synth-mouse event for WinTab tablet event";
+                return suppressPenMouseEvent();
+            }
 #endif
             break;
         }
     }
 
-    const MouseEvent mouseEvent = eventFromMsg(msg);
     Qt::MouseButtons mouseButtons;
 
     if (mouseEvent.type >= QEvent::NonClientAreaMouseMove && mouseEvent.type <= QEvent::NonClientAreaMouseButtonDblClick)
         mouseButtons = queryMouseButtons();
     else
         mouseButtons = mouseButtonsFromKeyState(msg.wParam);
+
+    if (mousePress)
+        m_penMouseFilter.recordDeliveredPress(mouseEvent.button);
+    if (mouseEvent.type == QEvent::MouseMove
+            || mouseEvent.type == QEvent::NonClientAreaMouseMove) {
+        const auto filteredButtons = m_penMouseFilter.filteredButtons(mouseButtons);
+        if (filteredButtons != mouseButtons && filteredButtons == Qt::NoButton)
+            return false;
+        mouseButtons = filteredButtons;
+    }
 
     // When the left/right mouse buttons are pressed over the window title bar
     // WM_NCLBUTTONDOWN/WM_NCRBUTTONDOWN messages are received. But no UP
@@ -872,6 +929,8 @@ bool QWindowsPointerHandler::translateMouseEvent(QWindow *window,
             QWindowSystemInterface::handleLeaveEvent(leaveTarget);
             m_windowUnderPointer = nullptr;
             m_currentWindow = nullptr;
+            if (m_currentPenWindow == leaveTarget)
+                m_currentPenWindow = nullptr;
         }
         return true;
     }

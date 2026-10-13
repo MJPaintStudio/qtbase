@@ -6,6 +6,7 @@
 #define QWINDOWSTABLETSUPPORT_H
 
 #include "qtwindowsglobal.h"
+#include "qwindowswintabmousefilter.h"
 #include <QtGui/qtguiglobal.h>
 #include <QtGui/qpointingdevice.h>
 
@@ -128,6 +129,8 @@ public:
 
     bool translateTabletProximityEvent(WPARAM wParam, LPARAM lParam);
     bool translateTabletPacketEvent();
+    bool isTabletInProximity() const { return m_state != PenUp; }
+    QWindowsWinTabMouseFilter &mouseFilter() { return m_mouseFilter; }
 
     static int absoluteRange() { return m_absoluteRange; }
     static void setAbsoluteRange(int a) { m_absoluteRange = a; }
@@ -158,6 +161,7 @@ private:
     Mode m_mode = PenMode;
     State m_state = PenUp;
     ulong m_eventTime = 0;
+    QWindowsWinTabMouseFilter m_mouseFilter;
 };
 
 QT_END_NAMESPACE

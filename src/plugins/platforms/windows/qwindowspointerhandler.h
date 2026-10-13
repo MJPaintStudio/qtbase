@@ -6,6 +6,7 @@
 #define QWINDOWSPOINTERHANDLER_H
 
 #include "qtwindowsglobal.h"
+#include "qwindowspenmousefilter.h"
 #include <QtCore/qt_windows.h>
 
 #include <QtCore/qpointer.h>
@@ -61,12 +62,18 @@ private:
     QHash<int, QWindowSystemInterface::TouchPoint> m_lastTouchPoints;
     QHash<DWORD, int> m_touchInputIDToTouchPointID;
     QPointer<QWindow> m_windowUnderPointer;
+    // Mouse handling. Needs to be "synced" with trackLeave so that leave events caused by mouse
+    // are always handled.
     QPointer<QWindow> m_currentWindow;
+    // Pen handling. Window was entered by pen event. No "trackLeave" needed because pen leave
+    // events happen independently of any tracking.
+    QPointer<QWindow> m_currentPenWindow;
     QWindow *m_previousCaptureWindow = nullptr;
     bool m_needsEnterOnPointerUpdate = false;
     QEvent::Type m_lastEventType = QEvent::None;
     Qt::MouseButton m_lastEventButton = Qt::NoButton;
     DWORD m_pointerType = 0;
+    QWindowsPenMouseFilter m_penMouseFilter;
     static qint64 m_nextInputDeviceId; // workaround until we know how to get system device IDs
 };
 
