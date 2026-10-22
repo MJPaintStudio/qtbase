@@ -7,7 +7,6 @@
 #include "qwindowswindow.h"
 #include "qwindowsintegration.h"
 
-#include <QtCore/qscopeguard.h>
 #include <QtCore/qdebug.h>
 #include <QtCore/qsysinfo.h>
 #include <QtGui/qcolorspace.h>
@@ -1242,81 +1241,15 @@ static inline const QOpenGLContextData *
     return nullptr;
 }
 
-void QWindowsGLContext::traceGeometry(const char *stage, const QOpenGLContextData &data,
-                                      bool success)
-{
-    if (!glGeometryTraceEnabled())
-        return;
-    const DWORD savedError = GetLastError();
-    const auto restoreError = qScopeGuard([savedError] { SetLastError(savedError); });
-    auto &trace = m_geometryTrace[data.hwnd];
-    if (trace.records >= 1200)
-        return;
-    const auto snapshot = QWindowsGLGeometrySnapshot::capture(data.hwnd);
-    if (!trace.sequence || !(snapshot == trace.snapshot)) {
-        trace.snapshot = snapshot;
-        ++trace.sequence;
-        trace.framesLeft = 10;
-    }
-    if (trace.framesLeft <= 0 && success)
-        return;
-
-    auto &gl = QOpenGLStaticContext::opengl32;
-    const HGLRC currentContext = gl.wglGetCurrentContext();
-    const HDC currentDC = gl.wglGetCurrentDC();
-    const bool current = currentContext == data.renderingContext && currentDC == data.hdc;
-    const bool swap = qstrcmp(stage, "swap-before") == 0;
-    GLint viewport[4]{}, scissor[4]{}, scissorEnabled = 0, drawBuffer = 0;
-    if (current && swap) {
-        gl.glGetIntegerv(GL_VIEWPORT, viewport);
-        gl.glGetIntegerv(GL_SCISSOR_BOX, scissor);
-        gl.glGetIntegerv(GL_SCISSOR_TEST, &scissorEnabled);
-        gl.glGetIntegerv(GL_DRAW_BUFFER, &drawBuffer);
-    }
-    if (current && !trace.driverLogged) {
-        trace.driverLogged = true;
-        qInfo() << "[HSJ_GL_GEOMETRY v3] driver hwnd=" << data.hwnd
-                << "hglrc=" << data.renderingContext
-                << "vendor=" << reinterpret_cast<const char *>(gl.glGetString(GL_VENDOR))
-                << "renderer=" << reinterpret_cast<const char *>(gl.glGetString(GL_RENDERER))
-                << "version=" << reinterpret_cast<const char *>(gl.glGetString(GL_VERSION))
-                << "pixelFormat=" << m_pixelFormat << "format=" << m_obtainedFormat
-                << "module=" << gl.moduleHandle();
-    }
-    qInfo() << "[HSJ_GL_GEOMETRY v3]" << stage
-            << "tick=" << GetTickCount64() << "tid=" << GetCurrentThreadId()
-            << "hwnd=" << data.hwnd << "context=" << this << "sequence=" << trace.sequence
-            << "frame=" << 11 - trace.framesLeft << "success=" << success
-            << "hdc=" << data.hdc << "hglrc=" << data.renderingContext
-            << "currentDC=" << currentDC << "currentContext=" << currentContext
-            << "current=" << current << snapshot
-            << "glStateValid=" << (current && swap)
-            << "viewport=" << QRect(viewport[0], viewport[1], viewport[2], viewport[3])
-            << "scissor=" << QRect(scissor[0], scissor[1], scissor[2], scissor[3])
-            << "scissorEnabled=" << scissorEnabled << "drawBuffer=" << Qt::hex << drawBuffer;
-    if (swap)
-        --trace.framesLeft;
-    if (++trace.records == 1200)
-        qInfo() << "[HSJ_GL_GEOMETRY v3] render-budget-exhausted hwnd=" << data.hwnd;
-}
-
 void QWindowsGLContext::swapBuffers(QPlatformSurface *surface)
 {
     if (QWindowsContext::verbose > 1)
         qCDebug(lcQpaGl) << __FUNCTION__ << surface;
 
-    if (const QOpenGLContextData *contextData = findByHWND(m_windowContexts, handleOf(surface))) {
-        traceGeometry("swap-before", *contextData, true);
-        const BOOL success = QOpenGLStaticContext::opengl32.swapBuffers(contextData->hdc);
-        if (!success && glGeometryTraceEnabled()) {
-            const DWORD error = GetLastError();
-            qInfo() << "[HSJ_GL_GEOMETRY v3] swap-failed hwnd=" << contextData->hwnd
-                    << "error=" << error;
-            SetLastError(error);
-        }
-    } else {
+    if (const QOpenGLContextData *contextData = findByHWND(m_windowContexts, handleOf(surface)))
+        QOpenGLStaticContext::opengl32.swapBuffers(contextData->hdc);
+    else
         qWarning("%s: Cannot find window %p", __FUNCTION__, handleOf(surface));
-    }
 }
 
 bool QWindowsGLContext::makeCurrent(QPlatformSurface *surface)
@@ -1337,13 +1270,11 @@ bool QWindowsGLContext::makeCurrent(QPlatformSurface *surface)
         // This is reproducible on NVidia cards and Intel onboard chips.
         if (QOpenGLStaticContext::opengl32.wglGetCurrentContext() == contextData->renderingContext
                 && QOpenGLStaticContext::opengl32.wglGetCurrentDC() == contextData->hdc) {
-            traceGeometry("make-current-reused", *contextData, true);
             return true;
         }
         const bool success = QOpenGLStaticContext::opengl32.wglMakeCurrent(contextData->hdc, contextData->renderingContext);
         if (!success)
             qErrnoWarning("%s: wglMakeCurrent() failed for existing context data", __FUNCTION__);
-        traceGeometry("make-current-bound", *contextData, success);
         return success;
     }
     // Create a new entry.
@@ -1376,8 +1307,6 @@ bool QWindowsGLContext::makeCurrent(QPlatformSurface *surface)
             qErrnoWarning("%s: wglMakeCurrent() failed", __FUNCTION__);
         }
     }
-
-    traceGeometry("make-current-new", newContext, success);
 
     // Set the swap interval
     if (m_staticContext->wglSwapInternalExt) {
