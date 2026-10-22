@@ -6,6 +6,7 @@
 #include <QtGui/qstylehints.h>
 
 #include "qwindowswindow.h"
+#include "qwindowsglgeometrytrace.h"
 #include "qwindowscontext.h"
 #include "qwindowstheme.h"
 #if QT_CONFIG(draganddrop)
@@ -2325,6 +2326,81 @@ void QWindowsWindow::setGeometry(const QRect &rectIn)
     }
 }
 
+void QWindowsWindow::checkForGlClientResize(const RECT &oldFrame, const RECT &oldClient,
+                                           const RECT &newFrame, const RECT &newClient)
+{
+    if (m_refreshingGlClientArea)
+        return;
+    m_glClientResizePending = false;
+    static const bool enabled = qEnvironmentVariableIntValue("QT_WINDOWS_GL_REFRESH_CLIENT_AREA") != 0
+            || !qEnvironmentVariableIsSet("QT_WINDOWS_GL_REFRESH_CLIENT_AREA");
+    if (!enabled || window()->surfaceType() != QSurface::OpenGLSurface
+        || !window()->isTopLevel() || window()->type() != Qt::Window
+        || IsIconic(m_data.hwnd) || IsZoomed(m_data.hwnd) || isFullScreen_sys()) {
+        return;
+    }
+    const auto size = [](const RECT &r) { return QSize(r.right - r.left, r.bottom - r.top); };
+    if (size(oldFrame) != size(newFrame) || size(oldClient) == size(newClient)
+        || size(oldClient).isEmpty() || size(newClient).isEmpty()) {
+        return;
+    }
+    // Query the native pixel format on the GUI thread. The GL initialization
+    // flags can be written by the render thread, and must not be used here.
+    const HDC dc = GetDC(m_data.hwnd);
+    if (dc) {
+        m_glClientResizePending = GetPixelFormat(dc) != 0;
+        ReleaseDC(m_data.hwnd, dc);
+    }
+}
+
+void QWindowsWindow::refreshGlClientArea()
+{
+    if (!m_glClientResizePending || m_refreshingGlClientArea)
+        return;
+    m_glClientResizePending = false;
+    if (IsIconic(m_data.hwnd) || IsZoomed(m_data.hwnd) || isFullScreen_sys())
+        return;
+    RECT frame = {};
+    if (!GetWindowRect(m_data.hwnd, &frame))
+        return;
+
+    // Some WGL drivers retain the old drawable size when only NCCALCSIZE
+    // changes the client area. Rebinding the context or repeating FRAMECHANGED
+    // is insufficient. A real native resize followed immediately by restoration
+    // invalidates that drawable without replacing the context or GL resources.
+    const int width = frame.right - frame.left;
+    const int height = frame.bottom - frame.top;
+    const UINT flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_NOOWNERZORDER | SWP_NOREDRAW;
+    const QPointer<QWindow> guardedWindow = window();
+    m_refreshingGlClientArea = true;
+    const bool resized = SetWindowPos(m_data.hwnd, nullptr, 0, 0, width, height + 1, flags);
+    if (!guardedWindow || guardedWindow->handle() != this)
+        return;
+    RECT intermediate = {};
+    const bool sizeChanged = GetWindowRect(m_data.hwnd, &intermediate)
+            && intermediate.bottom - intermediate.top != height;
+    const bool restored = SetWindowPos(m_data.hwnd, nullptr, 0, 0, width, height,
+                                       flags | SWP_FRAMECHANGED);
+    if (!guardedWindow || guardedWindow->handle() != this)
+        return;
+    m_refreshingGlClientArea = false;
+    RECT actual = {};
+    const bool sameFrame = GetWindowRect(m_data.hwnd, &actual) && EqualRect(&frame, &actual);
+    if (!resized || !sizeChanged || !restored || !sameFrame) {
+        qWarning() << "[HSJ_WGL_CLIENT_REFRESH v1] failed hwnd=" << m_data.hwnd
+                   << "resized=" << resized << "sizeChanged=" << sizeChanged
+                   << "restored=" << restored
+                   << "sameFrame=" << sameFrame;
+    } else {
+        qInfo() << "[HSJ_WGL_CLIENT_REFRESH v1] refreshed hwnd=" << m_data.hwnd
+                << "frame=" << QSize(width, height);
+    }
+    // SWP_NOREDRAW avoids painting the intermediate size. The original
+    // WINDOWPOSCHANGED now delivers only the final geometry to Qt.
+    InvalidateRect(m_data.hwnd, nullptr, FALSE);
+}
+
 void QWindowsWindow::handleMoved()
 {
     // Minimize/Set parent can send nonsensical move events.
@@ -2427,11 +2503,50 @@ void QWindowsWindow::checkForScreenChanged(ScreenChangeMode mode, const RECT *su
     QWindowSystemInterface::handleWindowScreenChanged<QWindowSystemInterface::SynchronousDelivery>(window(), newScreen->screen());
 }
 
+static bool nativeClientGeometry(HWND hwnd, QRect *geometry)
+{
+    RECT rect = {};
+    if (!GetClientRect(hwnd, &rect))
+        return false;
+    SetLastError(ERROR_SUCCESS);
+    // Mapping both corners also normalizes the rectangle for WS_EX_LAYOUTRTL.
+    if (!MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT *>(&rect), 2)
+        && GetLastError() != ERROR_SUCCESS) {
+        return false;
+    }
+    *geometry = qrectFromRECT(rect);
+    return true;
+}
+
+static void traceGlWindowGeometry(const char *stage, const QWindowsWindow *platformWindow)
+{
+    if (!glGeometryTraceEnabled()
+        || platformWindow->window()->surfaceType() != QSurface::OpenGLSurface) {
+        return;
+    }
+    const DWORD savedError = GetLastError();
+    const HWND hwnd = platformWindow->handle();
+    qInfo() << "[HSJ_GL_GEOMETRY v3]" << stage
+            << "tick=" << GetTickCount64() << "tid=" << GetCurrentThreadId()
+            << "hwnd=" << hwnd << "window=" << platformWindow->window()
+            << QWindowsGLGeometrySnapshot::capture(hwnd)
+            << "qtNative=" << platformWindow->geometry()
+            << "qtLogical=" << platformWindow->window()->geometry()
+            << "qtState=" << platformWindow->window()->windowStates()
+            << "margins=" << platformWindow->fullFrameMargins()
+            << "dpr=" << platformWindow->window()->devicePixelRatio()
+            << "alphaBuffer=" << platformWindow->window()->format().alphaBufferSize()
+            << "opacity=" << platformWindow->window()->opacity();
+    SetLastError(savedError);
+}
+
 void QWindowsWindow::handleGeometryChange()
 {
     const QRect previousGeometry = m_data.geometry;
+    traceGlWindowGeometry("geometry-before", this);
     updateFullFrameMargins();
     m_data.geometry = geometry_sys();
+    traceGlWindowGeometry("geometry", this);
     // Avoid superfluous geometry change events, possibly triggered by window
     // customization frameworks.
     if (m_data.geometry == previousGeometry)
@@ -3054,6 +3169,31 @@ void QWindowsWindow::calculateFullFrameMargins()
     GetWindowRect(handle(), &windowRect);
     GetClientRect(handle(), &clientRect);
 
+    // Candidate workaround for desktop GL windows with externally customized frames.
+    // Do not infer individual margins from the standard bottom resize border: the
+    // native client area can have asymmetric borders or have no borders at all.
+    // Keep expanded-client-area and non-GL windows on their existing code paths.
+    static const bool useNativeGeometry =
+            qEnvironmentVariable("QT_WINDOWS_GL_NATIVE_GEOMETRY") != QLatin1String("0");
+    if (useNativeGeometry && testFlag(OpenGLSurface) && isTopLevel()
+        && !(m_data.flags & Qt::ExpandedClientAreaHint) && !IsIconic(handle())) {
+        QRect nativeClient;
+        RECT nativeFrame = {};
+        if (GetWindowRect(handle(), &nativeFrame)
+            && nativeClientGeometry(handle(), &nativeClient)) {
+            const QMargins nativeMargins(nativeClient.x() - nativeFrame.left,
+                                         nativeClient.y() - nativeFrame.top,
+                                         nativeFrame.right - nativeClient.x() - nativeClient.width(),
+                                         nativeFrame.bottom - nativeClient.y() - nativeClient.height());
+            if (glGeometryTraceEnabled() && nativeMargins != m_data.fullFrameMargins) {
+                qInfo() << "[HSJ_GL_GEOMETRY v3] margins hwnd=" << handle()
+                        << "old=" << m_data.fullFrameMargins << "native=" << nativeMargins;
+            }
+            setFullFrameMargins(nativeMargins);
+            return;
+        }
+    }
+
     // QTBUG-117704 It is also possible that the user has manually removed the frame (for example
     // by handling WM_NCCALCSIZE). If that is the case, i.e., the client area and the window area
     // have identical sizes, we don't want to override the user-defined margins.
@@ -3101,10 +3241,13 @@ void QWindowsWindow::setOpacity(qreal level)
     qCDebug(lcQpaWindow) << __FUNCTION__ << level;
     if (!qFuzzyCompare(m_opacity, level)) {
         m_opacity = level;
-        if (m_data.hwnd)
+        if (m_data.hwnd) {
+            traceGlWindowGeometry("opacity-before", this);
             setWindowOpacity(m_data.hwnd, m_data.flags,
                              window()->format().hasAlpha(), testFlag(OpenGLSurface) || testFlag(VulkanSurface) || testFlag(Direct3DSurface),
                              level);
+            traceGlWindowGeometry("opacity-after", this);
+        }
     }
 }
 

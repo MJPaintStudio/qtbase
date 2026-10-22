@@ -295,6 +295,10 @@ public:
 
     void handleMoved();
     void handleResized(int wParam, LPARAM lParam);
+    void checkForGlClientResize(const RECT &oldFrame, const RECT &oldClient,
+                                const RECT &newFrame, const RECT &newClient);
+    void refreshGlClientArea();
+    bool isRefreshingGlClientArea() const { return m_refreshingGlClientArea; }
     void handleHidden();
     void handleCompositionSettingsChanged();
     void handleDpiScaledSize(WPARAM wParam, LPARAM lParam, LRESULT *result);
@@ -411,6 +415,8 @@ private:
 
     qsizetype m_vsyncServiceCallbackId = 0;
     QAtomicInt m_vsyncUpdatePending;
+    bool m_glClientResizePending = false;
+    bool m_refreshingGlClientArea = false;
 };
 
 #ifndef QT_NO_DEBUG_STREAM
