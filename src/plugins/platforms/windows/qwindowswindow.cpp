@@ -3094,13 +3094,18 @@ void QWindowsWindow::calculateFullFrameMargins()
     GetWindowRect(handle(), &windowRect);
     GetClientRect(handle(), &clientRect);
 
-    // Candidate workaround for desktop GL windows with externally customized frames.
+    // Use the actual client geometry for GL and Direct3D windows with customized frames.
     // Do not infer individual margins from the standard bottom resize border: the
-    // native client area can have asymmetric borders or have no borders at all.
-    // Keep expanded-client-area and non-GL windows on their existing code paths.
-    static const bool useNativeGeometry =
+    // native client area can have asymmetric borders, and system-DPI frame metrics
+    // can remain at the startup DPI after the display configuration changes.
+    // Keep expanded-client-area and other surface types on their existing paths.
+    static const bool useNativeGlGeometry =
             qEnvironmentVariable("QT_WINDOWS_GL_NATIVE_GEOMETRY") != QLatin1String("0");
-    if (useNativeGeometry && testFlag(OpenGLSurface) && isTopLevel()
+    static const bool useNativeD3dGeometry =
+            qEnvironmentVariable("QT_WINDOWS_D3D_NATIVE_GEOMETRY") != QLatin1String("0");
+    const bool useNativeGeometry = (useNativeGlGeometry && testFlag(OpenGLSurface))
+            || (useNativeD3dGeometry && testFlag(Direct3DSurface));
+    if (useNativeGeometry && isTopLevel()
         && !(m_data.flags & Qt::ExpandedClientAreaHint) && !IsIconic(handle())) {
         QRect nativeClient;
         RECT nativeFrame = {};
@@ -3110,7 +3115,8 @@ void QWindowsWindow::calculateFullFrameMargins()
                                          nativeClient.y() - nativeFrame.top,
                                          nativeFrame.right - nativeClient.x() - nativeClient.width(),
                                          nativeFrame.bottom - nativeClient.y() - nativeClient.height());
-            if (glGeometryTraceEnabled() && nativeMargins != m_data.fullFrameMargins) {
+            if (testFlag(OpenGLSurface) && glGeometryTraceEnabled()
+                && nativeMargins != m_data.fullFrameMargins) {
                 qInfo() << "[HSJ_GL_GEOMETRY v3] margins hwnd=" << handle()
                         << "old=" << m_data.fullFrameMargins << "native=" << nativeMargins;
             }
