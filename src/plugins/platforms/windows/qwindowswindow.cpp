@@ -2326,6 +2326,81 @@ void QWindowsWindow::setGeometry(const QRect &rectIn)
     }
 }
 
+void QWindowsWindow::checkForGlClientResize(const RECT &oldFrame, const RECT &oldClient,
+                                           const RECT &newFrame, const RECT &newClient)
+{
+    if (m_refreshingGlClientArea)
+        return;
+    m_glClientResizePending = false;
+    static const bool enabled = qEnvironmentVariableIntValue("QT_WINDOWS_GL_REFRESH_CLIENT_AREA") != 0
+            || !qEnvironmentVariableIsSet("QT_WINDOWS_GL_REFRESH_CLIENT_AREA");
+    if (!enabled || window()->surfaceType() != QSurface::OpenGLSurface
+        || !window()->isTopLevel() || window()->type() != Qt::Window
+        || IsIconic(m_data.hwnd) || IsZoomed(m_data.hwnd) || isFullScreen_sys()) {
+        return;
+    }
+    const auto size = [](const RECT &r) { return QSize(r.right - r.left, r.bottom - r.top); };
+    if (size(oldFrame) != size(newFrame) || size(oldClient) == size(newClient)
+        || size(oldClient).isEmpty() || size(newClient).isEmpty()) {
+        return;
+    }
+    // Query the native pixel format on the GUI thread. The GL initialization
+    // flags can be written by the render thread, and must not be used here.
+    const HDC dc = GetDC(m_data.hwnd);
+    if (dc) {
+        m_glClientResizePending = GetPixelFormat(dc) != 0;
+        ReleaseDC(m_data.hwnd, dc);
+    }
+}
+
+void QWindowsWindow::refreshGlClientArea()
+{
+    if (!m_glClientResizePending || m_refreshingGlClientArea)
+        return;
+    m_glClientResizePending = false;
+    if (IsIconic(m_data.hwnd) || IsZoomed(m_data.hwnd) || isFullScreen_sys())
+        return;
+    RECT frame = {};
+    if (!GetWindowRect(m_data.hwnd, &frame))
+        return;
+
+    // Some WGL drivers retain the old drawable size when only NCCALCSIZE
+    // changes the client area. Rebinding the context or repeating FRAMECHANGED
+    // is insufficient. A real native resize followed immediately by restoration
+    // invalidates that drawable without replacing the context or GL resources.
+    const int width = frame.right - frame.left;
+    const int height = frame.bottom - frame.top;
+    const UINT flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_NOOWNERZORDER | SWP_NOREDRAW;
+    const QPointer<QWindow> guardedWindow = window();
+    m_refreshingGlClientArea = true;
+    const bool resized = SetWindowPos(m_data.hwnd, nullptr, 0, 0, width, height + 1, flags);
+    if (!guardedWindow || guardedWindow->handle() != this)
+        return;
+    RECT intermediate = {};
+    const bool sizeChanged = GetWindowRect(m_data.hwnd, &intermediate)
+            && intermediate.bottom - intermediate.top != height;
+    const bool restored = SetWindowPos(m_data.hwnd, nullptr, 0, 0, width, height,
+                                       flags | SWP_FRAMECHANGED);
+    if (!guardedWindow || guardedWindow->handle() != this)
+        return;
+    m_refreshingGlClientArea = false;
+    RECT actual = {};
+    const bool sameFrame = GetWindowRect(m_data.hwnd, &actual) && EqualRect(&frame, &actual);
+    if (!resized || !sizeChanged || !restored || !sameFrame) {
+        qWarning() << "[HSJ_WGL_CLIENT_REFRESH v1] failed hwnd=" << m_data.hwnd
+                   << "resized=" << resized << "sizeChanged=" << sizeChanged
+                   << "restored=" << restored
+                   << "sameFrame=" << sameFrame;
+    } else {
+        qInfo() << "[HSJ_WGL_CLIENT_REFRESH v1] refreshed hwnd=" << m_data.hwnd
+                << "frame=" << QSize(width, height);
+    }
+    // SWP_NOREDRAW avoids painting the intermediate size. The original
+    // WINDOWPOSCHANGED now delivers only the final geometry to Qt.
+    InvalidateRect(m_data.hwnd, nullptr, FALSE);
+}
+
 void QWindowsWindow::handleMoved()
 {
     // Minimize/Set parent can send nonsensical move events.

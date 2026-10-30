@@ -1407,6 +1407,20 @@ static void traceGlNativeMessage(const char *stage, HWND hwnd, UINT message,
 
 LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (message == WM_WINDOWPOSCHANGED || message == WM_MOVE || message == WM_SIZE) {
+        if (auto *window = QWindowsContext::instance()->findPlatformWindow(hwnd)) {
+            // The native drawable refresh must not expose its temporary size to Qt
+            // or to application native event filters.
+            if (window->isRefreshingGlClientArea() && message != WM_WINDOWPOSCHANGED)
+                return 0;
+            if (message == WM_WINDOWPOSCHANGED)
+                window->refreshGlClientArea();
+        }
+    }
+    RECT oldFrame = {};
+    RECT oldClient = {};
+    const bool haveOldRects = message == WM_NCCALCSIZE && wParam
+            && GetWindowRect(hwnd, &oldFrame) && GetClientRect(hwnd, &oldClient);
     traceGlNativeMessage("before", hwnd, message, wParam, lParam);
     LRESULT result;
     const QtWindows::WindowsEventType et = windowsEventType(message, wParam, lParam);
@@ -1436,6 +1450,10 @@ LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND hwnd, UINT message, WPARAM wParam, 
             if (platformWindow) {
                 qCDebug(lcQpaWindow) << __FUNCTION__ << "WM_NCCALCSIZE for" << hwnd << margins;
                 platformWindow->setFullFrameMargins(margins);
+                if (haveOldRects) {
+                    platformWindow->checkForGlClientResize(oldFrame, oldClient, ncCalcSizeFrame,
+                                                          rectFromNcCalcSize(message, wParam, lParam, 0));
+                }
             } else {
                 const QSharedPointer<QWindowCreationContext> ctx = QWindowsContext::instance()->windowCreationContext();
                 if (!ctx.isNull())
